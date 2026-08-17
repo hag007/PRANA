@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Training output (model checkpoints, tensorboard runs)
+output/
+
+# Config files
+config/config.json
+
+tests/
