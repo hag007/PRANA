@@ -16,13 +16,60 @@ utils.py                device handling, auto_to_device
 config/config.json       dataset/output path configuration - edit this for your environment
 torch_dataset_cv.py      CV genotype loader (used by main.py)
 nn_models/prana.py       the PRANA model definition (class PRANA)
+prs_losses.py            PRANA's training objectives - notably ngl_r2_loss, the customized
+                          loss the model is trained with (see "Loss function" below)
+prs_metrics.py           PRS evaluation metrics (Nagelkerke R2, OR per 1 SD, AUROC/AUPRC);
+                          ngl_r2_loss builds on generate_glm from here
 main.py                  generic training/evaluation entry point - works with any dataset
                           that follows the standard CV fold layout
 ```
 
 ## Requirements
 
-`main.py` needs: `torch`, `pandas`, `numpy`, `scikit-learn`.
+`main.py` needs: `torch`, `pandas`, `numpy`, `scikit-learn`, `scipy`, `statsmodels`
+(`statsmodels` and `scipy` are pulled in by the `ngl_r2` loss via `prs_metrics.py`).
+
+## Loss function
+
+PRANA is not trained on plain cross-entropy. Its objective (`--loss ngl_r2`, the default) is
+a **differentiable surrogate of the Nagelkerke pseudo-R²** of a logistic regression of the
+phenotype on `[PRANA score + covariates]`, implemented as `ngl_r2_loss` in `prs_losses.py`:
+
+1. An inner logistic-regression head is fit on the standardized PRANA score plus the PCs,
+   by gradient descent, so it stays differentiable w.r.t. the score
+   (`train_logistic_regression`).
+2. Its log-likelihood is compared against the null-model log-likelihood from a statsmodels
+   GLM to form the Nagelkerke R².
+3. The loss is `(margin - R² · sign(corr(score, label)))²`, passed through a LeakyReLU and
+   normalized - so the network directly maximizes the metric the paper reports rather than
+   per-sample classification accuracy. A `PerfectSeparationError` in the GLM yields a zero
+   loss for that batch.
+
+`--loss bce` (class-weighted BCE on the fused output) and `--loss bce_prs` (class-weighted
+BCE on the raw PRS branch alone) are available as baselines, but they are *not* the
+published objective.
+
+## What gets adapted, and at what learning rate
+
+Two further details of the training recipe are easy to miss but materially change the
+result (`configure_trainable_params` and `derive_lr` in `main.py`):
+
+**The base PRS betas are frozen.** `mult_prs_weights` — the per-SNP effect sizes loaded
+from `--gwas_path`, the model's largest tensor — is held fixed. This is the method itself:
+PRANA adapts an existing PRS to a new ancestry through the layers *around* the score rather
+than refitting the score. Conversely `scaler_adapter`, the mixing weight in
+`h_out = h_prs + h_out1 * scaler_adapter`, is made trainable (the model constructor
+declares it `requires_grad=False`). Pass `--train_prs_weights` and/or
+`--freeze_adapter_scaler` to override either.
+
+**The learning rate is derived from the model, not tuned.** With `--lr` unset, it is
+`10 * sd(non-zero base PRS betas) / n_snps`. This scales the step size to the magnitude of
+the weights being adapted, so it transfers across GWAS panels of different sizes and
+effect-size scales without retuning. Passing `--lr` explicitly overrides it.
+
+Both defaults reproduce `main_scz_cv.py` / `main_cimba_cv.py` / `main_ukb_cv.py`. Running
+with `--train_prs_weights --freeze_adapter_scaler` reproduces `main_bcac_cv.py` /
+`main_bcac_loo.py`, which never applied the freezing step.
 
 ## Configuration
 
@@ -73,6 +120,10 @@ Below are PRANA's primary parameters:
 | `-p`, `--pheno_suffix` | `""` | Phenotype name used in the dataset's `pheno_<name>__<fold>` files. |
 | `-g`, `--gwas_path` (required) | - | TSV of GWAS summary statistics, SNP id as the index column - initializes the model's PRS layer. |
 | `--gwas_beta_col` | `BETA` | Column in `--gwas_path` holding the per-SNP effect size. |
+| `--loss` | `ngl_r2` | Training objective: `ngl_r2` (PRANA's customized differentiable Nagelkerke R² loss - see above), or the `bce` / `bce_prs` baselines. |
+| `-l`, `--lr` | *derived* | Learning rate. Unset means `10 * sd(non-zero base PRS betas) / n_snps`. |
+| `--train_prs_weights` | off | Also adapt the per-SNP base PRS betas, instead of keeping the score fixed. |
+| `--freeze_adapter_scaler` | off | Pin the adapter mixing weight at 1.0 instead of learning it. |
 
 Full list of parameteres is available at any time via
 `python main.py --help`.**

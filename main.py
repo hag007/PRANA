@@ -33,6 +33,7 @@ import utils
 from utils import tensor_dtype, auto_to_device
 from torch_dataset_cv import load_dataloader, param_builder_cv
 from nn_models.prana import PRANA
+from prs_losses import ngl_r2_loss
 
 
 def fold_label(fold, n_folds):
@@ -104,6 +105,50 @@ def create_model(df_mafs, rsids, df_gwas, n_pcs, dropout):
     return net
 
 
+def configure_trainable_params(net, train_prs_weights=False, train_adapter_scaler=True):
+    """Set which parameters PRANA adapts (the original scripts' unfreeze_layers()).
+
+    Starting from "everything trainable", this makes exactly two adjustments relative to
+    what PRANA.__init__ leaves behind:
+
+      * mult_prs_weights - the per-SNP base PRS betas, the model's largest tensor - is
+        frozen. This is the core of the method: PRANA *adapts* an existing PRS to a new
+        ancestry through the surrounding layers rather than refitting the score itself.
+      * scaler_adapter, which the constructor declares requires_grad=False, is turned on,
+        so the mixing weight in `h_out = h_prs + h_out1 * scaler_adapter` is learned
+        rather than pinned at 1.0.
+
+    The defaults reproduce main_scz_cv.py / main_cimba_cv.py / main_ukb_cv.py. Passing
+    train_prs_weights=True and train_adapter_scaler=False reproduces main_bcac_cv.py /
+    main_bcac_loo.py instead, which never called unfreeze_layers at all.
+
+    The original called this at the top of every epoch, but nothing else ever flips
+    requires_grad, so a single call at setup is equivalent.
+    """
+    for parameter in net.parameters():
+        parameter.requires_grad = True
+    net.mult_prs_weights.requires_grad = train_prs_weights
+    net.scaler_adapter.requires_grad = train_adapter_scaler
+
+
+def derive_lr(net):
+    """The learning rate the original train_epoch() recomputed from the model each epoch:
+    10 * sd(non-zero base PRS betas) / n_snps.
+
+    It scales the step size to the magnitude of the weights being adapted, so it carries
+    across GWAS panels of different sizes and effect-size scales without retuning. The
+    original scripts took a --lr flag but then overrode it with this, so --lr had no
+    effect; here it's the default and an explicit --lr wins.
+    """
+    snp_weight_sd = float(net.snp_weight_sd)
+    if not np.isfinite(snp_weight_sd) or snp_weight_sd == 0:
+        raise RuntimeError(
+            f"Cannot derive a learning rate: the base PRS betas have a non-zero SD of "
+            f"{snp_weight_sd} (are all --gwas_beta_col values zero, or did none of the "
+            f"GWAS SNP ids match the genotype panel?). Pass --lr explicitly to override.")
+    return 10.0 * snp_weight_sd / len(net.mult_prs_weights)
+
+
 def compute_pos_weight(labels):
     labels = np.asarray(labels, dtype=np.float32)
     n_pos = max(labels.sum(), 1.0)
@@ -111,7 +156,34 @@ def compute_pos_weight(labels):
     return auto_to_device(float(n_neg / n_pos))
 
 
-def train_epoch(net, loader, optimizer, pos_weight):
+def compute_loss(loss_name, labels, prediction, cov, final_weights, pos_weight):
+    """PRANA's training objective.
+
+    The default ("ngl_r2") is the customized loss the model was actually developed with: a
+    differentiable surrogate of the Nagelkerke pseudo-R^2 of a logistic regression of the
+    phenotype on [PRANA score + covariates] (prs_losses.ngl_r2_loss). This is what PRANA
+    optimizes for directly - the same quantity the paper reports - rather than per-sample
+    classification error, which is what a plain BCE would give.
+
+    The two BCE options are baselines/fallbacks, not the published objective:
+      "bce"     - class-weighted BCE on the fused PRANA output.
+      "bce_prs" - class-weighted BCE on the raw PRS branch alone (final_weights[:, 2]),
+                  i.e. the "adapter off" arm of the original alternating-update schedule.
+    """
+    if loss_name == "ngl_r2":
+        # Score matrix the pseudo-R^2 is computed on: PRANA's output as the 'score' column,
+        # followed by the covariates (PCs) it has to add signal on top of.
+        Xtrain = torch.hstack((prediction.flatten().reshape(-1, 1).to(utils.device),
+                               cov.to(utils.device)))
+        return ngl_r2_loss(labels.to(utils.device), Xtrain)
+    if loss_name == "bce_prs":
+        return nn.functional.binary_cross_entropy_with_logits(
+            final_weights[:, 2].flatten(), labels, pos_weight=pos_weight)
+    return nn.functional.binary_cross_entropy_with_logits(
+        prediction.flatten(), labels, pos_weight=pos_weight)
+
+
+def train_epoch(net, loader, optimizer, pos_weight, loss_name):
     net.train()
     total_loss, n_batches = 0.0, 0
     for inputs, labels, cov, sample_ids in loader:
@@ -120,9 +192,11 @@ def train_epoch(net, loader, optimizer, pos_weight):
         cov = cov.float().to(utils.device)
         labels = labels.float().to(utils.device)
 
-        prediction, _ = net(inputs, cov=cov)
-        loss = nn.functional.binary_cross_entropy_with_logits(
-            prediction.flatten(), labels, pos_weight=pos_weight)
+        # PRANA returns its fused score plus (..., final_weights, final_weights_raw), where
+        # final_weights stacks the [adapter, adapter, prs] branch outputs - compute_loss
+        # needs the prs branch for the "bce_prs" objective.
+        prediction, (_, _, _, _, final_weights, _) = net(inputs, cov=cov)
+        loss = compute_loss(loss_name, labels, prediction, cov, final_weights, pos_weight)
 
         loss.backward()
         optimizer.step()
@@ -170,18 +244,28 @@ def main(args):
     net = create_model(df_mafs, rsids_of(geno_sets["train"]), df_gwas, args.n_pcs, args.dropout)
 
     pos_weight = compute_pos_weight(geno_sets["train"].labels)
+    configure_trainable_params(net,
+                               train_prs_weights=args.train_prs_weights,
+                               train_adapter_scaler=not args.freeze_adapter_scaler)
+
+    lr = args.lr if args.lr is not None else derive_lr(net)
     if args.optimizer == "adam":
-        optimizer = optim.Adam(net.parameters(), lr=args.lr)
+        optimizer = optim.Adam(net.parameters(), lr=lr)
     else:
-        optimizer = optim.SGD(net.parameters(), lr=args.lr)
+        optimizer = optim.SGD(net.parameters(), lr=lr)
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Training PRANA on {args.dataset}/{args.rep}/fold {args.fold} "
           f"({len(geno_sets['train'])} train samples, {len(rsids_of(geno_sets['train']))} SNPs)")
+    print(f"  loss={args.loss}  optimizer={args.optimizer}  "
+          f"lr={lr:.3e}{'' if args.lr is not None else ' (derived from base PRS betas)'}")
+    print(f"  base PRS betas (mult_prs_weights): "
+          f"{'trainable' if args.train_prs_weights else 'frozen'}  |  adapter scaler: "
+          f"{'frozen' if args.freeze_adapter_scaler else 'trainable'}")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(net, loaders["train"], optimizer, pos_weight)
-        msg = f"epoch {epoch}/{args.epochs} - train_bce={train_loss:.4f}"
+        train_loss = train_epoch(net, loaders["train"], optimizer, pos_weight, args.loss)
+        msg = f"epoch {epoch}/{args.epochs} - train_{args.loss}={train_loss:.4f}"
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             for role, loader in loaders.items():
@@ -230,11 +314,27 @@ def get_args():
     parser.add_argument('--gwas_beta_col', default="BETA",
                          help="column in --gwas_path holding the per-SNP effect size")
 
+    parser.add_argument('--loss', choices=["ngl_r2", "bce", "bce_prs"], default="ngl_r2",
+                         help="training objective (see compute_loss). 'ngl_r2' is PRANA's "
+                              "customized loss - a differentiable Nagelkerke pseudo-R^2 of "
+                              "score+covariates - and is what the published results use; "
+                              "the 'bce*' options are plain class-weighted baselines")
+    parser.add_argument('--train_prs_weights', action='store_true',
+                         help="also adapt the per-SNP base PRS betas (mult_prs_weights). "
+                              "Off by default: PRANA adapts an existing PRS through the "
+                              "surrounding layers and keeps the score itself fixed")
+    parser.add_argument('--freeze_adapter_scaler', action='store_true',
+                         help="keep the adapter mixing weight pinned at its initial 1.0 "
+                              "instead of learning it (see configure_trainable_params)")
+
     parser.add_argument('--n_pcs', type=int, default=6)
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('-b', '--batch_size', type=int, default=1000)
     parser.add_argument('-e', '--epochs', type=int, default=50)
-    parser.add_argument('-l', '--lr', type=float, default=5e-2)
+    parser.add_argument('-l', '--lr', type=float, default=None,
+                         help="learning rate. When unset it is derived from the model as "
+                              "10 * sd(non-zero base PRS betas) / n_snps (see derive_lr), "
+                              "which is what the original per-dataset scripts trained with")
     parser.add_argument('--optimizer', choices=["sgd", "adam"], default="sgd")
     parser.add_argument('--eval_every', type=int, default=5)
     parser.add_argument('--force_reloading', action='store_true',
